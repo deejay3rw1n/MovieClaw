@@ -1,10 +1,12 @@
 /**
- * 主界面内容区的滚动状态：向下滑到一定距离后，底部页签栏收成一枚圆形按钮；
- * 往回滑（或滑回顶部）立刻放回整条底栏。
+ * 主界面内容区的滚动状态：向下滑到一定距离后，底部页签栏收起；往回滑、滑回顶
+ * 部或滑到内容最底都放回整条底栏。
  *
- * 为什么不在 HdsTabs 里做：官方悬浮页签栏只有「收起/展开」的显隐动效（`applyHideAnimation`），
- * 收起后不会自己留一枚按钮。这里把滚动方向汇总成一个信号，由 `MainTabsPage` 收起官方栏、
- * 叠一枚同材质的圆形按钮；点按钮放回整条底栏。
+ * 与官方栏的分工（2026-11 起按官方「上下布局」实现）：这里只汇总滚动方向出
+ * 「收起/放回」信号，`MainTabsPage` 拿它驱动官方状态机——收起且有「接着看」=
+ * 官方 `applyMiniBarStyle(EXPAND)`（滑动后：minibar 展开成一行、页签收成圆
+ * 钮，官方组件自己摆）；收起且没有「接着看」= 官方栏走官方显隐动效整条隐藏
+ * （`applyHideAnimation`），往回滑累计 10 放回，不再出自绘圆钮。
  *
  * `@ObservedV2` + `@Trace`：各页签根页在 `onDidScroll` 里上报，`MainTabsPage` 直接读。
  */
@@ -26,18 +28,30 @@ export class TabBarCollapse {
   }
 
   /**
-   * 根页内容滚动（传当前离顶距离）：同方向累计下滑超过 6 且离顶超过 24 才收起；
-   * 累计回滑超过 10、回到顶部（≤8）或点圆钮都展开。累计位移避免慢速滚动永远达不到阈值。
+   * 根页内容滚动（传当前离顶距离 + 是否已到内容底部）：同方向累计下滑超过 6 且
+   * 离顶超过 24 才收起；累计回滑超过 10、回到顶部（≤8）、滑到内容最底或点圆钮
+   * 都展开。累计位移避免慢速滚动永远达不到阈值。
    *
    * **dy 自己算**：List/Scroll 的 `onDidScroll(xOffset, yOffset)` 第二参实测恒为 1，
    * 不是每帧位移；位置差才是可靠的滚动方向。
    */
-  onScroll(top: number): void {
+  onScroll(top: number, atEnd: boolean): void {
     const dy: number = this.lastTop >= 0 ? top - this.lastTop : 0;
     this.lastTop = top;
     if (top <= 8) {
       this.collapsed = false;
       this.direction = 0;
+      this.distance = 0;
+      return;
+    }
+    /*
+     * 滑到内容最底：底下已没有内容，下一步多半是换页签/离开本页——放回整条底栏；
+     * 方向累计清零，离开底部后重新起算（下滑重新累计 6 才再收起）。
+     */
+    if (atEnd) {
+      if (this.collapsed) {
+        this.collapsed = false;
+      }
       this.distance = 0;
       return;
     }

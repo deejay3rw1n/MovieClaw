@@ -411,51 +411,78 @@ export default function playbackControllerTest() {
       expect(factory.mpv.calls.indexOf('seek:42000') < factory.mpv.calls.indexOf('play')).assertTrue();
       await controller.release();
     });
-    it('remote_resume_opens_mpv_directly_without_touching_avplayer', 0, async () => {
+    it('remote_hls_resume_lands_via_session_start_without_in_player_seek', 0, async () => {
       const factory = new FakeFactory(); const controller = new PlaybackController(factory);
       const intent = new PlaybackIntent(); intent.positionMs = 42000;
       await controller.open(new FakeRemoteMedia(factory.order), 'surface', intent);
-      expect(factory.created.join(',')).assertEqual('avplayer,mpv');
-      expect(factory.avp.calls.join(',')).assertEqual('release');
-      expect(factory.mpv.calls.includes('open:surface')).assertTrue();
-      expect(factory.mpv.calls.includes('seek:42000')).assertTrue();
-      expect(controller.current().engine).assertEqual('mpv');
+      // timeline='file'（v0.51 copyts 全片绝对列表）：续播落点由会话起播点
+      // （EXT-X-START）决定——avplayer 直接打开、流内零 seek、不换 mpv。
+      expect(factory.created.join(',')).assertEqual('avplayer');
+      expect(factory.avp.calls.includes('open:surface')).assertTrue();
+      expect(factory.avp.calls.filter((call: string): boolean => call.startsWith('seek:')).length)
+        .assertEqual(0);
+      expect(factory.mpv.calls.length).assertEqual(0);
+      expect(controller.current().engine).assertEqual('avplayer');
       expect(controller.current().playing).assertTrue();
       await controller.release();
-      expect(factory.order.join(',')).assertEqual('avplayer:release,lease:1:close,mpv:release,lease:2:close');
     });
-    it('remote_user_seek_swaps_to_mpv_keeping_the_target', 0, async () => {
+    it('remote_hls_user_seek_reopens_the_session_at_the_target', 0, async () => {
       const factory = new FakeFactory(); const controller = new PlaybackController(factory);
+      let reopenedAt = -1;
+      controller.onSeekOutsideWindow = (ms: number): void => { reopenedAt = ms; };
       await controller.open(new FakeRemoteMedia(factory.order), 'surface', new PlaybackIntent());
       expect(factory.created.join(',')).assertEqual('avplayer');
       await controller.seek(70000);
-      expect(factory.created.join(',')).assertEqual('avplayer,mpv');
-      expect(factory.order.join(',')).assertEqual('avplayer:release,lease:1:close');
-      expect(factory.mpv.calls.includes('seek:70000')).assertTrue();
-      expect(controller.current().engine).assertEqual('mpv');
+      // 流内跳转全拒（histreamer 假 seekDone 真冻结）：拖动交宿主按目标重开
+      // 会话——不换 mpv、不发流内 seek。
+      expect(reopenedAt).assertEqual(70000);
+      expect(factory.created.join(',')).assertEqual('avplayer');
+      expect(factory.avp.calls.filter((call: string): boolean => call.startsWith('seek:')).length)
+        .assertEqual(0);
+      expect(factory.mpv.calls.length).assertEqual(0);
       expect(controller.current().positionMs).assertEqual(70000);
       await controller.release();
     });
-    it('remote_seek_during_opening_defers_the_refusal_until_first_frame', 0, async () => {
+    it('remote_hls_seek_during_opening_reopens_immediately', 0, async () => {
       const factory = new FakeFactory(); const gate = new Gate(); factory.avp.gate = gate.promise;
       const controller = new PlaybackController(factory);
+      let reopenedAt = -1;
+      controller.onSeekOutsideWindow = (ms: number): void => { reopenedAt = ms; };
       const opening = controller.open(new FakeRemoteMedia(factory.order), 'surface', new PlaybackIntent());
       await microtasks();
       await controller.seek(50000);
+      // 打开中的拖动不等首帧、也不并入延迟目标：流内跳转全拒，立即按目标重开。
+      expect(reopenedAt).assertEqual(50000);
       gate.release(); await opening;
       expect(factory.created.join(',')).assertEqual('avplayer');
-      factory.avp.frame(); await microtasks(); await microtasks();
-      expect(factory.created.join(',')).assertEqual('avplayer,mpv');
-      expect(factory.mpv.calls.includes('seek:50000')).assertTrue();
+      expect(factory.mpv.calls.length).assertEqual(0);
       await controller.release();
     });
-    it('remote_fixed_avplayer_preference_fails_cleanly_instead_of_freezing', 0, async () => {
+    it('remote_hls_seek_before_engine_creation_reopens_once_the_source_is_known', 0, async () => {
+      const factory = new FakeFactory(); const gate = new Gate(); factory.creation = gate.promise;
+      const controller = new PlaybackController(factory);
+      const targets: number[] = [];
+      controller.onSeekOutsideWindow = (ms: number): void => { targets.push(ms); };
+      const opening = controller.open(new FakeRemoteMedia(factory.order), 'surface', new PlaybackIntent());
+      await microtasks();
+      await controller.seek(50000); await controller.seek(70000);
+      expect(targets.length).assertEqual(0);
+      gate.release(); await opening;
+      await controller.release();
+      expect(targets.join(',')).assertEqual('70000');
+      expect(factory.avp.calls.includes('open:surface')).assertFalse();
+      expect(factory.mpv.calls.length).assertEqual(0);
+    });
+    it('remote_hls_fixed_avplayer_preference_stays_on_avplayer', 0, async () => {
       const factory = new FakeFactory(); const controller = new PlaybackController(factory);
       const intent = new PlaybackIntent(); intent.positionMs = 42000;
       await controller.open(new FakeRemoteMedia(factory.order), 'surface', intent, 'avplayer');
+      // 不再「拒开保平安」：落点由会话起播点保证，流内零跳转即零冻结面。
       expect(factory.created.join(',')).assertEqual('avplayer');
-      expect(controller.current().phase).assertEqual('failed');
-      expect(controller.current().failure?.kind).assertEqual('unsupported');
+      expect(controller.current().playing).assertTrue();
+      expect(factory.avp.calls.filter((call: string): boolean => call.startsWith('seek:')).length)
+        .assertEqual(0);
+      expect(factory.mpv.calls.length).assertEqual(0);
       await controller.release();
     });
     it('remote_fresh_start_stays_on_avplayer', 0, async () => {
@@ -519,18 +546,23 @@ export default function playbackControllerTest() {
       expect(controller.current().positionMs).assertEqual(60000);
       await controller.release();
     });
-    it('remote_direct_out_resume_stays_on_avplayer_and_lands_after_the_first_frame', 0, async () => {
+    it('remote_direct_out_resume_seeks_in_prepared_state_and_lands_once', 0, async () => {
       const factory = new FakeFactory(); const controller = new PlaybackController(factory);
       const intent = new PlaybackIntent(); intent.positionMs = 42000;
       await controller.open(new FakeDirectRemoteMedia(factory.order), 'surface', intent);
-      // 直连远程流（Range 可 seek）不再一刀切转 mpv。
+      // 直连远程流（Range 可 seek）不转 mpv；续播 seek 提前到 open 刚返回的
+      // prepared 态发出（起播后前读塞满缓存再 seek 会楔死 histreamer），先于 play。
       expect(factory.created.join(',')).assertEqual('avplayer');
       expect(factory.mpv.calls.length).assertEqual(0);
-      expect(factory.avp.calls.includes('seek:42000')).assertFalse();
-      factory.avp.frame(); await microtasks(); await microtasks();
       expect(factory.avp.calls.includes('seek:42000')).assertTrue();
+      expect(factory.avp.calls.indexOf('seek:42000') < factory.avp.calls.indexOf('play')).assertTrue();
+      // 首帧落地后不原地补 seek（prepared 态已 seek 且窗口内无拖动）。
+      factory.avp.frame(); await microtasks(); await microtasks();
+      expect(factory.avp.calls.filter((call: string): boolean => call === 'seek:42000').length)
+        .assertEqual(1);
       expect(factory.created.join(',')).assertEqual('avplayer');
       expect(controller.current().engine).assertEqual('avplayer');
+      expect(controller.current().positionMs).assertEqual(42000);
       await controller.release();
     });
     it('remote_direct_out_user_seek_stays_on_avplayer', 0, async () => {
@@ -593,11 +625,29 @@ export default function playbackControllerTest() {
         { id: 1, kind: 'audio', language: 'eng', title: '', selected: false },
         { id: 2, kind: 'audio', language: 'eng', title: '', selected: false }
       ];
-      const intent = new PlaybackIntent(); intent.audio = { language: 'eng', title: '', ordinal: 1, sourceCount: 2 };
+      const intent = new PlaybackIntent(); intent.audio = { language: 'eng', title: '', ordinal: 1, sourceCount: 2, explicit: true };
       await controller.open(new FakeMedia(factory.order), 'surface', intent);
       factory.avp.frame(); await microtasks(); await microtasks();
       expect(factory.created.join(',')).assertEqual('avplayer,mpv');
       expect(factory.mpv.calls.includes('audio:2')).assertTrue();
+      await controller.release();
+    });
+    it('inherited_audio_preference_skips_instead_of_falling_back', 0, async () => {
+      const factory = new FakeFactory(); const controller = new PlaybackController(factory);
+      // 观看状态继承的偏好（无 explicit）：内核少报一条音轨也不整引擎回退——
+      // 跳过选轨继续播（内核默认轨），不把用户锁进 mpv。
+      factory.avp.fixtureTracks = [{ id: 1, kind: 'audio', language: 'eng', title: '', selected: true }];
+      factory.mpv.fixtureTracks = [
+        { id: 1, kind: 'audio', language: 'eng', title: '', selected: false },
+        { id: 2, kind: 'audio', language: 'eng', title: '', selected: false }
+      ];
+      const intent = new PlaybackIntent(); intent.audio = { language: 'eng', title: '', ordinal: 1, sourceCount: 2 };
+      await controller.open(new FakeMedia(factory.order), 'surface', intent);
+      factory.avp.frame(); await microtasks(); await microtasks();
+      expect(factory.created.join(',')).assertEqual('avplayer');
+      expect(factory.avp.calls.filter((call: string): boolean => call.startsWith('audio:')).length)
+        .assertEqual(0);
+      expect(controller.current().phase).assertEqual('playing');
       await controller.release();
     });
     it('track_preferences_are_mapped_to_each_engines_ids', 0, async () => {
@@ -678,6 +728,22 @@ export default function playbackControllerTest() {
       await microtasks(); await microtasks();
       expect(factory.created.join(',')).assertEqual('mpv,mpv');
       expect(factory.order.join(',')).assertEqual('mpv:release,lease:1:close');
+      expect(factory.mpv.calls.includes('seek:45000')).assertTrue();
+      expect(controller.current().phase).assertEqual('playing');
+      await controller.release();
+    });
+    it('frozen_avp_direct_remote_switches_to_mpv', 0, async () => {
+      const factory = new FakeFactory(); const controller = new PlaybackController(factory);
+      const intent = new PlaybackIntent(); intent.positionMs = 42000;
+      await controller.open(new FakeDirectRemoteMedia(factory.order), 'surface', intent);
+      factory.avp.frame(); await microtasks();
+      factory.avp.time(45000);
+      // AVP 远程直连源（非 HLS、无 fd）冻结也直转 mpv：实测冻结根因是服务端中
+      // 继的上游断流，同引擎重开只会把全新实例再撞死在同一个断流窗口里（三次
+      // 重开全部只播 59~87ms）；mpv 缓冲有耐心、熬到上游恢复就能接着播。
+      factory.avp.frozen(45000);
+      await microtasks(); await microtasks();
+      expect(factory.created.join(',')).assertEqual('avplayer,mpv');
       expect(factory.mpv.calls.includes('seek:45000')).assertTrue();
       expect(controller.current().phase).assertEqual('playing');
       await controller.release();

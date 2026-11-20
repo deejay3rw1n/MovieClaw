@@ -1,6 +1,7 @@
 import { display, promptAction } from '@kit.ArkUI';
 import { Theme } from '../theme/AppTheme';
 import { GlassButtonModifier, GlassTone } from '../common/GlassControls';
+import { NativeDialog } from '../common/NativeDialog';
 import { AppNavBar } from '../common/AppNavBar';
 import { MemberCredentialDialog } from './MemberCredentialDialog';
 import { SettingsSegmentChip, SettingsSwitchRow, SettingsTwoStateSegment } from '../common/SettingsControls';
@@ -18,6 +19,7 @@ import {
   MemberStatusRequest,
   MemberUpdateRequest,
   MemberView, CatalogItem } from '../api/Models';
+import { SpatialMaterial } from '../common/SpatialMaterial';
 
 /**
  * `MemberUpdateRequest` **全是可选字段**，对象字面量会被 ArkTS 拒绝
@@ -537,6 +539,7 @@ export struct MembersSection {
       height: SheetSize.LARGE,
       dragBar: true,
       showClose: false,
+      systemMaterial: SpatialMaterial.sheet(),
       backgroundColor: Theme.bg
     })
   }
@@ -1155,18 +1158,10 @@ export struct MembersSection {
     this.credentialUsername = username;
     this.credentialPassword = password;
     const screenWidthVp: number = this.getUIContext().px2vp(display.getDefaultDisplaySync().width);
-    const options: promptAction.CustomDialogOptions = {
-      builder: (): void => {
+    const options: promptAction.CustomDialogOptions =
+      NativeDialog.options((): void => {
         this.CredentialCard();
-      },
-      width: Math.round(screenWidthVp - 32),
-      alignment: DialogAlignment.Bottom,
-      keyboardAvoidMode: KeyboardAvoidMode.DEFAULT,
-      autoCancel: true,
-      maskColor: 'rgba(0,0,0,0.6)',
-      backgroundColor: Theme.surfaceRaised,
-      cornerRadius: Theme.cardRadius
-    };
+      }, screenWidthVp);
     this.getUIContext().getPromptAction().openCustomDialog(options)
       .then((id: number): void => {
         this.credentialDialogId = id;

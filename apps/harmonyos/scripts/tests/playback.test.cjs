@@ -18,14 +18,57 @@ const gate = () => {
 };
 async function drain() { for (let i = 0; i < 80; i++) { await Promise.resolve(); } }
 
+// Fold/orientation enums mirror the SDK values PhonePlaybackHost and FoldState read.
+const windowOrientations = { UNSPECIFIED: 0, PORTRAIT: 1, LANDSCAPE: 2, AUTO_ROTATION: 3,
+  AUTO_ROTATION_PORTRAIT: 4, AUTO_ROTATION_LANDSCAPE: 5, AUTO_ROTATION_RESTRICTED: 6, UNLOCKED: 7, LOCKED: 8 };
+function foldDisplayMock() {
+  const foldStatus = { FOLD_STATUS_UNKNOWN: 0, FOLD_STATUS_EXPANDED: 1, FOLD_STATUS_HALF_FOLDED: 2, FOLD_STATUS_FOLDED: 3 };
+  return { FoldStatus: foldStatus, getFoldStatus: () => foldStatus.FOLD_STATUS_EXPANDED,
+    on() {}, off() {}, getDefaultDisplaySync: () => ({ width: 1216, height: 2688 }) };
+}
+
+// The ets-loader transpiler keeps V2 decorators and two ArkUI globals as bare
+// identifiers; the on-device runtime provides them. Inert stand-ins let
+// @ObservedV2 classes load and construct here (no observation needed — host
+// tests read plain fields and call methods).
+globalThis.ObservedV2 = (cls) => cls;
+globalThis.Trace = () => {};
+globalThis.Track = () => {};
+globalThis.Type = () => {};
+globalThis.Monitor = () => () => {};
+globalThis.Computed = () => () => {};
+globalThis.NavPathStack = class { size() { return 0; } pop() {} };
+globalThis.XComponentController = class {};
+
 function runtime(overrides = {}, timers = globalThis) {
   const cache = new Map();
   const kits = {
     '@kit.MediaKit': {}, '@kit.AudioKit': {}, '@kit.BasicServicesKit': { deviceInfo: { productModel: 'host-test' } },
     '@kit.NetworkKit': {}, '@kit.CoreFileKit': {}, '@kit.ArkData': {},
-    '@kit.ArkTS': { util: { TextDecoder: { create: () => ({ decodeToString: (bytes) => new TextDecoder().decode(bytes) }) } } },
+    '@kit.ArkTS': (() => {
+      class TextDecoderShim {
+        decodeToString(bytes) { return new globalThis.TextDecoder().decode(bytes); }
+        decodeWithStream(bytes) { return new globalThis.TextDecoder().decode(bytes); }
+      }
+      TextDecoderShim.create = () => new TextDecoderShim();
+      class TextEncoderShim {
+        encode(text) { return new globalThis.TextEncoder().encode(text); }
+        encodeInto(text, destination) { return new globalThis.TextEncoder().encodeInto(text, destination); }
+      }
+      return { util: { TextDecoder: TextDecoderShim, TextEncoder: TextEncoderShim,
+        generateRandomUUID: () => globalThis.crypto.randomUUID(),
+        Base64Helper: class { encodeToString(text) { return Buffer.from(text).toString('base64'); } } } };
+    })(),
     '@kit.AbilityKit': {}, '@kit.AVSessionKit': {}, '@kit.BackgroundTasksKit': {},
     '@kit.PerformanceAnalysisKit': { hilog: { info() {}, warn() {}, error() {} } },
+    '@kit.ArkUI': {
+      display: foldDisplayMock(),
+      window: { getLastWindow: async () => ({ setPreferredOrientation: async () => {} }), Orientation: windowOrientations },
+      UIContext: class {}, PiPWindow: {},
+    },
+    '@kit.ImageKit': { image: {} },
+    '@kit.AssetStoreKit': { asset: {} },
+    '@kit.CryptoArchitectureKit': { cryptoFramework: {} },
     '@ohos/hypium': {
       describe,
       it: (name, level, run) => test(name, run),
@@ -66,7 +109,7 @@ function runtime(overrides = {}, timers = globalThis) {
 
 // Run the same shared suites registered by the on-device Hypium runner.
 const shared = runtime();
-for (const suite of ['PlaybackController', 'PlaybackSession', 'PlaybackGateway', 'HomeRows', 'StaleLoadGuard', 'PgsPrepareGuard']) {
+for (const suite of ['PlaybackController', 'PlaybackSession', 'PlaybackGateway', 'HomeRows', 'StaleLoadGuard', 'PgsPrepareGuard', 'PlayerInteraction']) {
   shared(`entry/src/test/${suite}.test.ets`).default();
 }
 
@@ -199,6 +242,56 @@ test('MPV frozen clock reaches the startup deadline', async () => {
   f.emit('time', { positionMs: 0 }); await f.timers.advance(25000);
   assert.equal(f.controller.current().failure.kind, 'timeout'); await f.controller.release();
 });
+
+for (const stage of ['create', 'acquire', 'previous release']) {
+  test(`HLS startup drag during ${stage} reopens at the latest target and keeps later seeks exact`, async () => {
+    const f = playerFixture(); const waiting = gate(); const opened = []; const seeks = [];
+    const load = runtime({}, f.timers);
+    const { PhonePlaybackHost } = load('entry/src/main/ets/playback/PhonePlaybackHost.ets');
+    const { PlaybackIntent } = load('playback/Index.ets');
+    const host = new PhonePlaybackHost(); host.controller = f.controller; host.bindController();
+    const acquire = f.media.acquire;
+    f.media.acquire = async () => {
+      if (stage === 'acquire') { await waiting.promise; }
+      const lease = await acquire(); lease.source.isHls = true;
+      lease.source.url = 'https://fixture.invalid/old/index.m3u8'; return lease;
+    };
+    f.engine.open = async (source) => { opened.push(source.url); };
+    f.engine.seek = async (ms) => { seeks.push(ms); };
+    if (stage === 'create') { f.controller.factory.create = async () => { await waiting.promise; return f.engine; }; }
+    if (stage === 'previous release') {
+      await f.controller.open(f.media, 'previous', f.intent);
+      f.engine.release = () => waiting.promise; opened.length = 0;
+    }
+    const requests = []; let reopening;
+    // Replace only the server negotiation boundary. The production host's seek,
+    // outside-window callback and snapshot binding drive the real controller.
+    host.negotiate = async () => {
+      requests.push([host.startMs, host.resumeExplicit]);
+      const intent = new PlaybackIntent(); intent.positionMs = host.startMs;
+      const media = { ...f.media, acquire: async () => {
+        const lease = await acquire(); lease.source.isHls = true;
+        lease.source.url = `https://fixture.invalid/start-${intent.positionMs}/index.m3u8`; return lease;
+      } };
+      reopening = f.controller.open(media, 'surface', intent); await reopening;
+    };
+    const opening = f.controller.open(f.media, 'surface', f.intent);
+    await drain(); host.seekTo(50000); host.seekTo(70000); await drain();
+    assert.deepEqual(requests, []);
+    waiting.resolve(); await opening; await drain(); await reopening;
+    try {
+      assert.deepEqual(requests, [[70000, true]]);
+      assert.deepEqual(opened, ['https://fixture.invalid/start-70000/index.m3u8']);
+      f.emit('firstFrame'); await drain(); f.emit('time', { positionMs: 71000 });
+      assert.equal(host.positionMs, 71000);
+      host.seekTo(30000); await drain(); await reopening;
+      f.emit('firstFrame'); await drain(); f.emit('time', { positionMs: 31000 });
+      assert.deepEqual(requests, [[70000, true], [30000, true]]);
+      assert.equal(host.positionMs, 31000); assert.deepEqual(seeks, []);
+    } finally { await f.controller.release(); }
+    assert.equal(f.closes(), stage === 'previous release' ? 4 : 3);
+  });
+}
 
 test('pause cancels startup and resume receives a fresh deadline', async () => {
   const f = playerFixture();
@@ -1226,18 +1319,26 @@ for (const engine of ['avplayer', 'mpv']) {
       const { PhoneMedia } = load('entry/src/main/ets/playback/PhoneMedia.ets');
       const media = new PhoneMedia(30000, 100000, '', '/movie.mp4', 'https://signed.invalid/sub?token=secret', '', '/cache');
       const lease = await media.acquire(engine);
-      assert.equal(lease.source.fd, 10); assert.equal(lease.source.subtitleUrl, ''); assert.equal(destroyed, 1);
-      assert.equal(options.connectTimeout, 10000); assert.equal(options.readTimeout, 60000);
-      const available = status === 200 || (status === 'bitmap' && engine === 'mpv');
+      assert.equal(lease.source.fd, 10); assert.equal(lease.source.subtitleUrl, '');
+      // 1ada1ad43 起 avplayer 的文本旁挂一律由宿主自下载解析自绘，acquire 不碰
+      // 网络与文件；mpv 照旧走 acquire 内下载（HTTP 客户端用完即毁）。
+      const fetched = engine === 'mpv';
+      assert.equal(destroyed, fetched ? 1 : 0);
+      if (fetched) {
+        assert.equal(options.connectTimeout, 10000); assert.equal(options.readTimeout, 60000);
+      }
+      const available = fetched && (status === 200 || status === 'bitmap');
       assert.equal(lease.source.subtitleFd, available ? 20 : -1);
-      if (status === 200) {
+      if (status === 200 && fetched) {
         const content = files.get(30);
         assert.ok((typeof content === 'string' ? content : new TextDecoder().decode(content))
-          .startsWith(engine === 'avplayer' ? '00:00:02,500' : '00:00:32,500'));
-        assert.equal(lease.source.subtitleOffsetMs, engine === 'mpv' ? 30000 : 0);
+          .startsWith('00:00:32,500'));
+        assert.equal(lease.source.subtitleOffsetMs, 30000);
       } else if (available) {
         assert.deepEqual([...new Uint8Array(files.get(30))], [0x50, 0x47, 0, 0xff]);
-      } else { assert.equal(warnings.length, 1); assert.ok(!warnings[0].includes('secret')); }
+      } else if (fetched) {
+        assert.equal(warnings.length, 1); assert.ok(!warnings[0].includes('secret'));
+      } else { assert.equal(warnings.length, 0); }
       const { PlaybackController, PlaybackIntent } = load('playback/Index.ets');
       const controller = new PlaybackController({ create: async () => ({ id: engine, onEvent() {},
         open: async () => {}, setRate: async () => {}, setGain: async () => {}, setSubtitleStyle: async () => {},
@@ -1447,4 +1548,77 @@ test('the genre fingerprint moves with exclude, viewer access, and metadata refr
   // Round 9: the world is stable — nothing is requested.
   await store.reload(api, 'owner');
   assert.equal(genreCalls, 7);
+  assert.deepEqual(store.genresByKind, { movie: [{ name: 'Drama', count: 2 }] });
+});
+
+// —— Pura X 折叠竞态（PR #1289 审查 P2-1/P2-2 的宿主回归覆盖）——
+// toggleLandscape 是异步的：等窗口、写偏好都可能横跨一次折叠事件。过期的
+// 横屏请求不得把锁写上外屏；普通手机的原有锁定/解锁行为保持不变。
+
+test('toggleLandscape on a normal phone locks landscape and toggles back to portrait', async () => {
+  const writes = [];
+  const load = runtime({ '@kit.ArkUI': {
+    display: foldDisplayMock(),
+    window: { getLastWindow: async () => ({ setPreferredOrientation: async (o) => { writes.push(o); } }),
+      Orientation: windowOrientations },
+  } });
+  const { PhonePlaybackHost } = load('entry/src/main/ets/playback/PhonePlaybackHost.ets');
+  const host = new PhonePlaybackHost();
+  host.bindUI({ getHostContext: () => ({}) });
+  await host.toggleLandscape();
+  assert.equal(host.landscapeLocked, true);
+  await host.toggleLandscape();
+  assert.equal(host.landscapeLocked, false);
+  assert.deepEqual(writes, [windowOrientations.AUTO_ROTATION_LANDSCAPE, windowOrientations.PORTRAIT]);
+});
+
+test('a fold landing while toggleLandscape still waits for the window never locks the cover into landscape', async () => {
+  const writes = [];
+  const windowGate = gate();
+  const load = runtime({ '@kit.ArkUI': {
+    display: foldDisplayMock(),
+    window: { getLastWindow: async () => {
+      await windowGate.promise;
+      return { setPreferredOrientation: async (o) => { writes.push(o); } };
+    }, Orientation: windowOrientations },
+  } });
+  const { PhonePlaybackHost } = load('entry/src/main/ets/playback/PhonePlaybackHost.ets');
+  const { FoldState } = load('entry/src/main/ets/common/FoldState.ets');
+  const host = new PhonePlaybackHost();
+  host.bindUI({ getHostContext: () => ({}) });
+  const toggling = host.toggleLandscape();
+  await drain();
+  // 折叠事件在 getLastWindow 释放前到达：这次过期的切换必须整体作废，
+  // 落地后既不锁横屏、也不碰方向偏好（外屏保持竖屏）。
+  FoldState.shared().coverActive = true;
+  windowGate.resolve();
+  await toggling;
+  assert.equal(host.landscapeLocked, false);
+  assert.deepEqual(writes, []);
+});
+
+test('a fold landing while the landscape write is in flight is corrected back to portrait', async () => {
+  const writes = [];
+  const writeGate = gate();
+  const load = runtime({ '@kit.ArkUI': {
+    display: foldDisplayMock(),
+    window: { getLastWindow: async () => ({ setPreferredOrientation: async (o) => {
+      if (o === windowOrientations.AUTO_ROTATION_LANDSCAPE) { await writeGate.promise; }
+      writes.push(o);
+    } }), Orientation: windowOrientations },
+  } });
+  const { PhonePlaybackHost } = load('entry/src/main/ets/playback/PhonePlaybackHost.ets');
+  const { FoldState } = load('entry/src/main/ets/common/FoldState.ets');
+  const host = new PhonePlaybackHost();
+  host.bindUI({ getHostContext: () => ({}) });
+  const toggling = host.toggleLandscape();
+  await drain();
+  assert.equal(host.landscapeLocked, true);
+  // 横屏写入还在途时折叠：写入落地后必须复查折叠态，把锁摘掉并补正竖屏
+  // （两次写入都收敛竖屏，幂等）。
+  FoldState.shared().coverActive = true;
+  writeGate.resolve();
+  await toggling;
+  assert.equal(host.landscapeLocked, false);
+  assert.deepEqual(writes, [windowOrientations.AUTO_ROTATION_LANDSCAPE, windowOrientations.PORTRAIT]);
 });
